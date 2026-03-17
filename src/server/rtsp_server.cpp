@@ -1245,10 +1245,16 @@ private:
         // 创建RTP发送器
         if (!use_tcp) {
             session_->rtp_sender = std::make_unique<RtpSender>();
-            uint16_t local_rtp_port = RtspServerConfig::getNextRtpPort(
-                config_.rtp_port_current, config_.rtp_port_start, config_.rtp_port_end);
-            
-            if (!session_->rtp_sender->init("0.0.0.0", local_rtp_port)) {
+            bool sender_ready = false;
+            for (int attempt = 0; attempt < 32; ++attempt) {
+                uint16_t local_rtp_port = RtspServerConfig::getNextRtpPort(
+                    config_.rtp_port_current, config_.rtp_port_start, config_.rtp_port_end);
+                if (session_->rtp_sender->init("0.0.0.0", local_rtp_port)) {
+                    sender_ready = true;
+                    break;
+                }
+            }
+            if (!sender_ready) {
                 sendResponse(RtspResponse::createError(cseq, 500, "Internal Server Error"));
                 session_.reset();
                 return;

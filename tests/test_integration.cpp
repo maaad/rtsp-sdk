@@ -21,6 +21,7 @@
 #include <vector>
 #ifndef _WIN32
 #include <dirent.h>
+#include <unistd.h>
 #endif
 
 using namespace rtsp;
@@ -654,6 +655,74 @@ void test_auto_parameter_set_extraction() {
     std::cout << "  Auto parameter-set extraction tests passed!" << std::endl;
 }
 
+void test_setup_retries_server_rtp_port_range() {
+    std::cout << "Testing server SETUP retries next RTP port..." << std::endl;
+#ifndef _WIN32
+    if (geteuid() == 0) {
+        std::cout << "  Skipped retry test while running as root." << std::endl;
+        return;
+    }
+#endif
+
+    RtspServerConfig cfg;
+    cfg.host = "127.0.0.1";
+    cfg.port = 19671;
+    cfg.rtp_port_start = 1023;
+    cfg.rtp_port_end = 1031;
+    cfg.rtp_port_current = 1023;
+
+    RtspServer server;
+    assert(server.init(cfg));
+    assert(server.addPath("/live", CodecType::H264));
+    assert(server.start());
+
+    RtspClient client;
+    assert(client.open("rtsp://127.0.0.1:19671/live"));
+    assert(client.describe());
+    assert(client.setup(0));
+    assert(!client.getStats().using_tcp_transport);
+
+    client.close();
+    assert(server.stopWithTimeout(2000));
+    std::cout << "  Server SETUP retry tests passed!" << std::endl;
+}
+
+void test_setup_fallback_to_tcp_on_server_udp_alloc_failure() {
+    std::cout << "Testing client SETUP falls back to TCP on server UDP alloc failure..." << std::endl;
+#ifndef _WIN32
+    if (geteuid() == 0) {
+        std::cout << "  Skipped TCP fallback test while running as root." << std::endl;
+        return;
+    }
+#endif
+
+    RtspServerConfig cfg;
+    cfg.host = "127.0.0.1";
+    cfg.port = 19672;
+    cfg.rtp_port_start = 1;
+    cfg.rtp_port_end = 3;
+    cfg.rtp_port_current = 1;
+
+    RtspServer server;
+    assert(server.init(cfg));
+    assert(server.addPath("/live", CodecType::H264));
+    assert(server.start());
+
+    RtspClient client;
+    RtspClientConfig ccfg;
+    ccfg.prefer_tcp_transport = false;
+    ccfg.fallback_to_tcp = true;
+    client.setConfig(ccfg);
+    assert(client.open("rtsp://127.0.0.1:19672/live"));
+    assert(client.describe());
+    assert(client.setup(0));
+    assert(client.getStats().using_tcp_transport);
+
+    client.close();
+    assert(server.stopWithTimeout(2000));
+    std::cout << "  TCP fallback SETUP tests passed!" << std::endl;
+}
+
 void test_receive_interrupt_and_stop_timeout() {
     std::cout << "Testing receive interrupt and stop timeout..." << std::endl;
 
@@ -924,6 +993,8 @@ int main() {
         test_tcp_interleaved_streaming();
         test_digest_auth();
         test_auto_parameter_set_extraction();
+        test_setup_retries_server_rtp_port_range();
+        test_setup_fallback_to_tcp_on_server_udp_alloc_failure();
         test_receive_interrupt_and_stop_timeout();
         test_stop_latency_under_2s();
         test_open_play_stop_50_loops();

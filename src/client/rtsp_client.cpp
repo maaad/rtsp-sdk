@@ -18,6 +18,10 @@ namespace rtsp {
 
 namespace {
 
+bool responseHasStatusCode(const std::string& response, int code) {
+    return response.find(std::to_string(code)) != std::string::npos;
+}
+
 std::shared_ptr<std::vector<uint8_t>> makeManagedBuffer(const uint8_t* data, size_t size) {
     auto buf = std::make_shared<std::vector<uint8_t>>();
     if (data && size > 0) {
@@ -1057,10 +1061,17 @@ bool RtspClient::setup(int stream_index) {
     bool use_tcp = impl_->config_.prefer_tcp_transport;
     bool ok = do_setup(use_tcp, response);
     if (!ok && impl_->config_.fallback_to_tcp) {
-        if (!use_tcp && response.find("461") != std::string::npos) {
+        const bool udp_can_fallback = response.empty() ||
+            responseHasStatusCode(response, 400) ||
+            responseHasStatusCode(response, 461) ||
+            responseHasStatusCode(response, 500) ||
+            responseHasStatusCode(response, 503);
+        const bool tcp_can_fallback = responseHasStatusCode(response, 400) ||
+            responseHasStatusCode(response, 461);
+        if (!use_tcp && udp_can_fallback) {
             use_tcp = true;
             ok = do_setup(use_tcp, response);
-        } else if (use_tcp && (response.find("461") != std::string::npos || response.find("400") != std::string::npos)) {
+        } else if (use_tcp && tcp_can_fallback) {
             use_tcp = false;
             ok = do_setup(use_tcp, response);
         }
