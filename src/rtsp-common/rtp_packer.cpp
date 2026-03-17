@@ -501,6 +501,9 @@ RtpSender::RtpSender() : impl_(std::make_unique<Impl>()) {}
 RtpSender::~RtpSender() = default;
 
 bool RtpSender::init(const std::string& local_ip, uint16_t local_port) {
+    if (!impl_) {
+        return false;
+    }
     // RTP socket
     if (!impl_->rtp_socket_.bindUdp(local_ip, local_port)) {
         return false;
@@ -516,6 +519,9 @@ bool RtpSender::init(const std::string& local_ip, uint16_t local_port) {
 }
 
 bool RtpSender::setPeer(const std::string& peer_ip, uint16_t peer_rtp_port, uint16_t peer_rtcp_port) {
+    if (!impl_) {
+        return false;
+    }
     impl_->peer_ip_ = peer_ip;
     impl_->peer_rtp_port_ = peer_rtp_port;
     impl_->peer_rtcp_port_ = peer_rtcp_port;
@@ -523,6 +529,7 @@ bool RtpSender::setPeer(const std::string& peer_ip, uint16_t peer_rtp_port, uint
 }
 
 bool RtpSender::sendRtpPacket(const RtpPacket& packet) {
+    if (!impl_) return false;
     if (impl_->peer_rtp_port_ == 0) return false;
     
     ssize_t sent = impl_->rtp_socket_.sendTo(packet.data, packet.size, 
@@ -541,6 +548,7 @@ bool RtpSender::sendRtpPackets(const std::vector<RtpPacket>& packets) {
 
 bool RtpSender::sendSenderReport(uint32_t rtp_timestamp, uint64_t ntp_timestamp,
                                   uint32_t packet_count, uint32_t octet_count) {
+    if (!impl_) return false;
     if (impl_->peer_rtcp_port_ == 0) return false;
     
     // 构建RTCP Sender Report

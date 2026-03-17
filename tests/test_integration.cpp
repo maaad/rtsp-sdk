@@ -523,7 +523,7 @@ void test_tcp_interleaved_streaming() {
 
     std::thread push_thread([&server]() {
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        const std::vector<uint8_t> h264 = {
+        const std::vector<uint8_t> small_h264 = {
             0x00, 0x00, 0x00, 0x01,
             0x67, 0x42, 0x00, 0x28,
             0x00, 0x00, 0x00, 0x01,
@@ -531,14 +531,50 @@ void test_tcp_interleaved_streaming() {
             0x00, 0x00, 0x00, 0x01,
             0x65, 0x88, 0x84, 0x21
         };
-        for (int i = 0; i < 10; ++i) {
+        std::vector<uint8_t> large_h264 = {
+            0x00, 0x00, 0x00, 0x01,
+            0x67, 0x42, 0x00, 0x28,
+            0x00, 0x00, 0x00, 0x01,
+            0x68, 0xCE, 0x3C, 0x80,
+            0x00, 0x00, 0x00, 0x01,
+            0x65
+        };
+        large_h264.resize(160000, 0x55);
+        large_h264[0] = 0x00;
+        large_h264[1] = 0x00;
+        large_h264[2] = 0x00;
+        large_h264[3] = 0x01;
+        large_h264[4] = 0x67;
+        large_h264[5] = 0x42;
+        large_h264[6] = 0x00;
+        large_h264[7] = 0x28;
+        large_h264[8] = 0x00;
+        large_h264[9] = 0x00;
+        large_h264[10] = 0x00;
+        large_h264[11] = 0x01;
+        large_h264[12] = 0x68;
+        large_h264[13] = 0xCE;
+        large_h264[14] = 0x3C;
+        large_h264[15] = 0x80;
+        large_h264[16] = 0x00;
+        large_h264[17] = 0x00;
+        large_h264[18] = 0x00;
+        large_h264[19] = 0x01;
+        large_h264[20] = 0x65;
+
+        for (int i = 0; i < 3; ++i) {
             assert(server.pushH264Data("/live",
-                                       h264.data(),
-                                       h264.size(),
+                                       small_h264.data(),
+                                       small_h264.size(),
                                        static_cast<uint64_t>(100 + i * 40),
                                        true));
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
         }
+        assert(server.pushH264Data("/live",
+                                   large_h264.data(),
+                                   large_h264.size(),
+                                   300,
+                                   true));
     });
 
     VideoFrame frame{};
@@ -556,7 +592,7 @@ void test_tcp_interleaved_streaming() {
 
     push_thread.join();
     auto ss = server.getStats();
-    assert(ss.rtp_packets_sent >= 1);
+    assert(ss.rtp_packets_sent >= 100);
     assert(ss.frames_pushed >= 1);
     client.close();
     server.stop();

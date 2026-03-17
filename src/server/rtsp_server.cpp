@@ -858,7 +858,7 @@ struct ClientSession {
                             std::lock_guard<std::mutex> sock_lock(*control_send_mutex);
                             control_socket->send(interleaved.data(), interleaved.size());
                         }
-                    } else {
+                    } else if (rtp_sender) {
                         rtp_sender->sendRtpPacket(packet);
                     }
                     packet_count++;
@@ -871,8 +871,8 @@ struct ClientSession {
                 }
                 last_activity = std::chrono::steady_clock::now();
                 
-                // 定期发送RTCP SR
-                if (packet_count % 100 == 0) {
+                // RTCP SR is only valid for UDP sender sessions.
+                if (!use_tcp_interleaved && rtp_sender && (packet_count % 100 == 0)) {
                     auto now = std::chrono::system_clock::now();
                     auto epoch = now.time_since_epoch();
                     uint64_t ntp_ts = std::chrono::duration_cast<std::chrono::seconds>(epoch).count();
