@@ -252,7 +252,7 @@ void test_server_start_stop() {
     RtspServer server;
     
     // 先添加路径再启动
-    assert(server.init("127.0.0.1", 18554));  // 使用高位端口避免冲突
+    assert(server.init("127.0.0.1", 19654));  // 使用高位端口避免冲突
     assert(server.addPath("/live", CodecType::H264));
     
     // 启动服务器
@@ -289,7 +289,7 @@ void test_push_frame() {
     std::cout << "Testing frame pushing..." << std::endl;
     
     RtspServer server;
-    assert(server.init("127.0.0.1", 18555));
+    assert(server.init("127.0.0.1", 19655));
     assert(server.addPath("/stream", CodecType::H264));
     assert(server.start());
     
@@ -329,7 +329,7 @@ void test_push_raw_data() {
     std::cout << "Testing raw data pushing..." << std::endl;
     
     RtspServer server;
-    assert(server.init("127.0.0.1", 18556));
+    assert(server.init("127.0.0.1", 19656));
     assert(server.addPath("/h264", CodecType::H264));
     assert(server.addPath("/h265", CodecType::H265));
     assert(server.start());
@@ -371,7 +371,7 @@ void test_config_management() {
     RtspServer server;
     RtspServerConfig server_config;
     server_config.host = "127.0.0.1";
-    server_config.port = 18558;
+    server_config.port = 19658;
     server_config.session_timeout_ms = 30000;
     server_config.rtp_port_start = 20000;
     server_config.rtp_port_end = 30000;
@@ -398,7 +398,7 @@ void test_concurrent_operations() {
     std::cout << "Testing concurrent operations..." << std::endl;
     
     RtspServer server;
-    assert(server.init("127.0.0.1", 18559));
+    assert(server.init("127.0.0.1", 19659));
     
     // 添加多个路径
     for (int i = 0; i < 5; i++) {
@@ -445,12 +445,12 @@ void test_client_pause_resume_keepalive() {
     std::cout << "Testing client pause/resume and keepalive..." << std::endl;
 
     RtspServer server;
-    assert(server.init("127.0.0.1", 18560));
+    assert(server.init("127.0.0.1", 19660));
     assert(server.addPath("/live", CodecType::H264));
     assert(server.start());
 
     RtspClient client;
-    assert(client.open("rtsp://127.0.0.1:18560/live"));
+    assert(client.open("rtsp://127.0.0.1:19660/live"));
     assert(client.describe());
     assert(client.setup(0));
     assert(client.play(0));
@@ -470,7 +470,7 @@ void test_basic_auth() {
 
     RtspServerConfig cfg;
     cfg.host = "127.0.0.1";
-    cfg.port = 18561;
+    cfg.port = 19661;
     cfg.auth_enabled = true;
     cfg.auth_username = "user";
     cfg.auth_password = "pass";
@@ -482,12 +482,12 @@ void test_basic_auth() {
     assert(server.start());
 
     RtspClient no_auth_client;
-    assert(no_auth_client.open("rtsp://127.0.0.1:18561/live"));
+    assert(no_auth_client.open("rtsp://127.0.0.1:19661/live"));
     assert(!no_auth_client.describe());
     no_auth_client.close();
 
     RtspClient auth_client;
-    assert(auth_client.open("rtsp://user:pass@127.0.0.1:18561/live"));
+    assert(auth_client.open("rtsp://user:pass@127.0.0.1:19661/live"));
     assert(auth_client.describe());
     assert(auth_client.setup(0));
     assert(auth_client.play(0));
@@ -505,7 +505,7 @@ void test_tcp_interleaved_streaming() {
     std::cout << "Testing TCP interleaved streaming..." << std::endl;
 
     RtspServer server;
-    assert(server.init("127.0.0.1", 18562));
+    assert(server.init("127.0.0.1", 19662));
     assert(server.addPath("/live", CodecType::H264));
     assert(server.start());
 
@@ -515,22 +515,37 @@ void test_tcp_interleaved_streaming() {
     ccfg.fallback_to_tcp = true;
     client.setConfig(ccfg);
 
-    assert(client.open("rtsp://127.0.0.1:18562/live"));
+    assert(client.open("rtsp://127.0.0.1:19662/live"));
     assert(client.describe());
     assert(client.setup(0));
     assert(client.play(0));
 
     std::thread push_thread([&server]() {
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        std::vector<uint8_t> h264 = {
+        const std::vector<uint8_t> h264 = {
+            0x00, 0x00, 0x00, 0x01,
+            0x67, 0x42, 0x00, 0x28,
+            0x00, 0x00, 0x00, 0x01,
+            0x68, 0xCE, 0x3C, 0x80,
             0x00, 0x00, 0x00, 0x01,
             0x65, 0x88, 0x84, 0x21
         };
-        server.pushH264Data("/live", h264.data(), h264.size(), 100, true);
+        for (int i = 0; i < 10; ++i) {
+            assert(server.pushH264Data("/live",
+                                       h264.data(),
+                                       h264.size(),
+                                       static_cast<uint64_t>(100 + i * 40),
+                                       true));
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
     });
 
     VideoFrame frame{};
-    assert(client.receiveFrame(frame, 2000));
+    bool got = false;
+    for (int i = 0; i < 20 && !got; ++i) {
+        got = client.receiveFrame(frame, 200);
+    }
+    assert(got);
     assert(frame.codec == CodecType::H264);
     assert(frame.size > 4);
 
@@ -552,7 +567,7 @@ void test_digest_auth() {
 
     RtspServerConfig cfg;
     cfg.host = "127.0.0.1";
-    cfg.port = 18563;
+    cfg.port = 19663;
     cfg.auth_enabled = true;
     cfg.auth_use_digest = true;
     cfg.auth_username = "du";
@@ -567,12 +582,12 @@ void test_digest_auth() {
     assert(server.start());
 
     RtspClient no_auth_client;
-    assert(no_auth_client.open("rtsp://127.0.0.1:18563/live"));
+    assert(no_auth_client.open("rtsp://127.0.0.1:19663/live"));
     assert(!no_auth_client.describe());
     no_auth_client.close();
 
     RtspClient digest_client;
-    assert(digest_client.open("rtsp://du:dp@127.0.0.1:18563/live"));
+    assert(digest_client.open("rtsp://du:dp@127.0.0.1:19663/live"));
     std::this_thread::sleep_for(std::chrono::milliseconds(5)); // force nonce stale path
     assert(digest_client.describe());
     assert(digest_client.setup(0));
@@ -589,7 +604,7 @@ void test_auto_parameter_set_extraction() {
     std::cout << "Testing auto parameter-set extraction..." << std::endl;
 
     RtspServer server;
-    assert(server.init("127.0.0.1", 18564));
+    assert(server.init("127.0.0.1", 19664));
     assert(server.addPath("/h264", CodecType::H264));
     assert(server.addPath("/h265", CodecType::H265));
     assert(server.start());
@@ -617,7 +632,7 @@ void test_auto_parameter_set_extraction() {
     assert(server.pushH265Data("/h265", h265_key.data(), h265_key.size(), 0, true));
 
     RtspClient h264_client;
-    assert(h264_client.open("rtsp://127.0.0.1:18564/h264"));
+    assert(h264_client.open("rtsp://127.0.0.1:19664/h264"));
     assert(h264_client.describe());
     auto h264_info = h264_client.getSessionInfo();
     assert(!h264_info.media_streams.empty());
@@ -626,7 +641,7 @@ void test_auto_parameter_set_extraction() {
     h264_client.close();
 
     RtspClient h265_client;
-    assert(h265_client.open("rtsp://127.0.0.1:18564/h265"));
+    assert(h265_client.open("rtsp://127.0.0.1:19664/h265"));
     assert(h265_client.describe());
     auto h265_info = h265_client.getSessionInfo();
     assert(!h265_info.media_streams.empty());
@@ -643,12 +658,12 @@ void test_receive_interrupt_and_stop_timeout() {
     std::cout << "Testing receive interrupt and stop timeout..." << std::endl;
 
     RtspServer server;
-    assert(server.init("127.0.0.1", 18565));
+    assert(server.init("127.0.0.1", 19665));
     assert(server.addPath("/live", CodecType::H264));
     assert(server.start());
 
     RtspClient client;
-    assert(client.open("rtsp://127.0.0.1:18565/live"));
+    assert(client.open("rtsp://127.0.0.1:19665/live"));
     assert(client.describe());
     assert(client.setup(0));
     assert(client.play(0));
@@ -674,12 +689,12 @@ void test_receive_interrupt_and_stop_timeout() {
 void test_stop_latency_under_2s() {
     std::cout << "Testing stop latency <= 200ms for receive waiters..." << std::endl;
     RtspServer server;
-    assert(server.init("127.0.0.1", 18567));
+    assert(server.init("127.0.0.1", 19667));
     assert(server.addPath("/live", CodecType::H264));
     assert(server.start());
 
     RtspClient client;
-    assert(client.open("rtsp://127.0.0.1:18567/live"));
+    assert(client.open("rtsp://127.0.0.1:19667/live"));
     assert(client.describe());
     assert(client.setup(0));
     assert(client.play(0));
@@ -731,7 +746,7 @@ static long percentileMs(std::vector<long> v, double p) {
 void test_open_play_stop_50_loops() {
     std::cout << "Testing 50x open/play/stop stability..." << std::endl;
     RtspServer server;
-    assert(server.init("127.0.0.1", 18568));
+    assert(server.init("127.0.0.1", 19668));
     assert(server.addPath("/live", CodecType::H264));
     assert(server.start());
 
@@ -741,7 +756,7 @@ void test_open_play_stop_50_loops() {
 
     for (int i = 0; i < 50; ++i) {
         RtspClient client;
-        assert(client.open("rtsp://127.0.0.1:18568/live"));
+        assert(client.open("rtsp://127.0.0.1:19668/live"));
         assert(client.describe());
         assert(client.setup(0));
         assert(client.play(0));
@@ -779,7 +794,7 @@ void test_publish_client_api_smoke() {
 
 void test_publish_client_to_mock_server() {
     std::cout << "Testing RTSP publisher to mock server..." << std::endl;
-    MockPublishRtspServer mock(18569, 31000);
+    MockPublishRtspServer mock(19669, 31000);
     mock.start();
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
@@ -787,7 +802,7 @@ void test_publish_client_to_mock_server() {
     RtspPublishConfig cfg;
     cfg.local_rtp_port = 25020;
     pub.setConfig(cfg);
-    assert(pub.open("rtsp://127.0.0.1:18569/live/publish"));
+    assert(pub.open("rtsp://127.0.0.1:19669/live/publish"));
 
     PublishMediaInfo media;
     media.codec = CodecType::H264;
@@ -828,6 +843,71 @@ void test_publish_client_to_mock_server() {
     std::cout << "  RTSP publisher to mock server tests passed!" << std::endl;
 }
 
+void test_publish_client_to_builtin_server() {
+    std::cout << "Testing RTSP publisher to builtin server..." << std::endl;
+
+    RtspServer server;
+    assert(server.init("127.0.0.1", 19670));
+    assert(server.start());
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    RtspPublisher pub;
+    RtspPublishConfig pub_cfg;
+    pub_cfg.local_rtp_port = 25040;
+    pub.setConfig(pub_cfg);
+    assert(pub.open("rtsp://127.0.0.1:19670/live/publish"));
+
+    PublishMediaInfo media;
+    media.codec = CodecType::H264;
+    media.payload_type = 96;
+    media.width = 640;
+    media.height = 480;
+    media.fps = 25;
+    media.sps = {0x67, 0x42, 0x00, 0x28};
+    media.pps = {0x68, 0xCE, 0x3C, 0x80};
+    media.control_track = "streamid=0";
+    assert(pub.announce(media));
+    assert(pub.setup());
+    assert(pub.record());
+
+    RtspClient client;
+    RtspClientConfig client_cfg;
+    client_cfg.prefer_tcp_transport = true;
+    client_cfg.fallback_to_tcp = true;
+    client.setConfig(client_cfg);
+    assert(client.open("rtsp://127.0.0.1:19670/live/publish"));
+    assert(client.describe());
+    assert(client.setup(0));
+    assert(client.play(0));
+
+    const std::vector<uint8_t> idr = {
+        0x00, 0x00, 0x00, 0x01,
+        0x67, 0x42, 0x00, 0x28,
+        0x00, 0x00, 0x00, 0x01,
+        0x68, 0xCE, 0x3C, 0x80,
+        0x00, 0x00, 0x00, 0x01,
+        0x65, 0x88, 0x84, 0x21
+    };
+
+    VideoFrame frame{};
+    bool got = false;
+    for (int i = 0; i < 20 && !got; ++i) {
+        assert(pub.pushH264Data(idr.data(), idr.size(), static_cast<uint64_t>(i * 40), true));
+        got = client.receiveFrame(frame, 200);
+    }
+
+    assert(got);
+    assert(frame.codec == CodecType::H264);
+    assert(frame.size == idr.size());
+    assert(frame.width == 640);
+    assert(frame.height == 480);
+
+    client.close();
+    pub.close();
+    server.stop();
+    std::cout << "  RTSP publisher to builtin server tests passed!" << std::endl;
+}
+
 int main() {
     std::cout << "=== Running Integration Tests ===" << std::endl;
     
@@ -849,6 +929,7 @@ int main() {
         test_open_play_stop_50_loops();
         test_publish_client_api_smoke();
         test_publish_client_to_mock_server();
+        test_publish_client_to_builtin_server();
         
         std::cout << "\n=== All Integration Tests Passed! ===" << std::endl;
         return 0;

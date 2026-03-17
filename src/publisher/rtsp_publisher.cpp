@@ -159,7 +159,8 @@ bool RtspPublisher::setup() {
 
     std::string resp;
     std::ostringstream headers;
-    headers << "Transport: RTP/AVP;unicast;client_port=" << local_rtp << "-" << local_rtcp << "\r\n";
+    headers << "Transport: RTP/AVP;unicast;client_port=" << local_rtp << "-" << local_rtcp
+            << ";mode=record\r\n";
     std::string track_url = impl_->request_url_ + "/" + (impl_->media_.control_track.empty() ? "streamid=0" : impl_->media_.control_track);
     if (!impl_->sendRequest("SETUP", track_url, headers.str(), "", resp)) return false;
     if (resp.find("200 OK") == std::string::npos) return false;

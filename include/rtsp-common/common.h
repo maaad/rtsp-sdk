@@ -68,16 +68,16 @@ struct RtpPacket {
 
 // SDP媒体信息
 struct SdpMediaInfo {
-    CodecType codec;
+    CodecType codec = CodecType::H264;
     std::string payload_name;
-    uint8_t payload_type;
-    uint32_t clock_rate;
+    uint8_t payload_type = 0;
+    uint32_t clock_rate = 0;
     std::string sps;        // Base64编码的SPS
     std::string pps;        // Base64编码的PPS
     std::string vps;        // Base64编码的VPS (仅HEVC)
-    uint32_t width;
-    uint32_t height;
-    uint32_t fps;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t fps = 0;
 };
 
 // 时间戳转换工具

@@ -146,6 +146,501 @@ bool joinThreadWithTimeout(std::thread& t, uint32_t timeout_ms) {
     return false;
 }
 
+std::string toLowerCopy(std::string text) {
+    std::transform(text.begin(), text.end(), text.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    return text;
+}
+
+bool isRecordTransport(const std::string& transport) {
+    return toLowerCopy(transport).find("mode=record") != std::string::npos;
+}
+
+class PublishRtpReceiver {
+public:
+    using FrameCallback = std::function<void(const VideoFrame&)>;
+
+    PublishRtpReceiver() = default;
+    ~PublishRtpReceiver() { stop(); }
+
+    bool init(uint16_t rtp_port, uint16_t rtcp_port) {
+        if (!rtp_socket_.bindUdp("0.0.0.0", rtp_port)) {
+            return false;
+        }
+        if (!rtcp_socket_.bindUdp("0.0.0.0", rtcp_port)) {
+            rtp_socket_.close();
+            return false;
+        }
+        rtp_socket_.setNonBlocking(true);
+        rtcp_socket_.setNonBlocking(true);
+        rtp_port_ = rtp_socket_.getLocalPort();
+        rtcp_port_ = rtcp_socket_.getLocalPort();
+        return true;
+    }
+
+    void start() {
+        if (running_) {
+            return;
+        }
+        running_ = true;
+        receive_thread_ = std::thread([this]() { receiveLoop(); });
+    }
+
+    bool stopWithTimeout(uint32_t timeout_ms) {
+        if (!running_ && !receive_thread_.joinable()) {
+            return true;
+        }
+
+        running_ = false;
+        rtp_socket_.shutdownReadWrite();
+        rtcp_socket_.shutdownReadWrite();
+        if (rtp_port_ != 0) {
+            Socket wake_socket;
+            if (wake_socket.bindUdp("0.0.0.0", 0)) {
+                uint8_t marker = 0;
+                wake_socket.sendTo(&marker, 1, "127.0.0.1", rtp_port_);
+            }
+        }
+
+        const bool joined = joinThreadWithTimeout(receive_thread_, timeout_ms);
+        rtp_socket_.close();
+        rtcp_socket_.close();
+        clearCurrentFrameState();
+        reorder_buffer_.clear();
+        seq_initialized_ = false;
+        reorder_initialized_ = false;
+        return joined;
+    }
+
+    void stop() {
+        (void)stopWithTimeout(2000);
+    }
+
+    void setCallback(FrameCallback callback) {
+        callback_ = std::move(callback);
+    }
+
+    void setVideoInfo(CodecType codec, uint32_t width, uint32_t height, uint32_t fps, uint8_t payload_type) {
+        codec_ = codec;
+        width_ = width;
+        height_ = height;
+        fps_ = fps;
+        payload_type_ = payload_type;
+    }
+
+    uint16_t getRtpPort() const { return rtp_port_; }
+    uint16_t getRtcpPort() const { return rtcp_port_; }
+
+private:
+    static uint32_t parseRtpTimestampFromRaw(const uint8_t* data, size_t len) {
+        if (!data || len < 8) {
+            return 0;
+        }
+        return (static_cast<uint32_t>(data[4]) << 24) |
+               (static_cast<uint32_t>(data[5]) << 16) |
+               (static_cast<uint32_t>(data[6]) << 8) |
+               static_cast<uint32_t>(data[7]);
+    }
+
+    static uint32_t parseRtpTimestampFromPacket(const std::vector<uint8_t>& packet) {
+        return parseRtpTimestampFromRaw(packet.data(), packet.size());
+    }
+
+    void ingestRtpPacket(const uint8_t* data, size_t len) {
+        if (!data || len < 12) {
+            return;
+        }
+
+        const uint16_t seq = static_cast<uint16_t>((data[2] << 8) | data[3]);
+        const uint32_t ts = parseRtpTimestampFromRaw(data, len);
+
+        if (!reorder_initialized_) {
+            expected_seq_ = seq;
+            reorder_initialized_ = true;
+        }
+
+        reorder_buffer_[seq] = std::vector<uint8_t>(data, data + len);
+
+        while (true) {
+            auto it = reorder_buffer_.find(expected_seq_);
+            if (it == reorder_buffer_.end()) {
+                break;
+            }
+            processRtpPacket(it->second.data(), it->second.size());
+            reorder_buffer_.erase(it);
+            expected_seq_ = static_cast<uint16_t>(expected_seq_ + 1);
+        }
+
+        if (reorder_buffer_.size() > jitter_buffer_packets_) {
+            auto it = reorder_buffer_.begin();
+            expected_seq_ = it->first;
+            while (true) {
+                auto run = reorder_buffer_.find(expected_seq_);
+                if (run == reorder_buffer_.end()) {
+                    break;
+                }
+                processRtpPacket(run->second.data(), run->second.size());
+                reorder_buffer_.erase(run);
+                expected_seq_ = static_cast<uint16_t>(expected_seq_ + 1);
+            }
+        }
+
+        if (!reorder_buffer_.empty() && reorder_buffer_.find(expected_seq_) == reorder_buffer_.end()) {
+            auto first_it = reorder_buffer_.begin();
+            const uint32_t first_ts = parseRtpTimestampFromPacket(first_it->second);
+            if (ts != first_ts) {
+                expected_seq_ = first_it->first;
+                while (true) {
+                    auto run = reorder_buffer_.find(expected_seq_);
+                    if (run == reorder_buffer_.end()) {
+                        break;
+                    }
+                    processRtpPacket(run->second.data(), run->second.size());
+                    reorder_buffer_.erase(run);
+                    expected_seq_ = static_cast<uint16_t>(expected_seq_ + 1);
+                }
+            }
+        }
+    }
+
+    void appendAnnexBNalu(const uint8_t* nalu, size_t len) {
+        if (!nalu || len == 0) {
+            return;
+        }
+        static const uint8_t start_code[] = {0x00, 0x00, 0x00, 0x01};
+        frame_buffer_.insert(frame_buffer_.end(), start_code, start_code + 4);
+        frame_buffer_.insert(frame_buffer_.end(), nalu, nalu + len);
+    }
+
+    bool isH265Irap(uint8_t nal_type) const {
+        return nal_type >= 16 && nal_type <= 21;
+    }
+
+    void clearCurrentFrameState() {
+        frame_buffer_.clear();
+        frame_is_idr_ = false;
+        frame_in_progress_ = false;
+    }
+
+    void emitFrame(uint32_t timestamp) {
+        if (frame_buffer_.empty()) {
+            return;
+        }
+
+        VideoFrame frame{};
+        frame.codec = codec_;
+        frame.pts = timestamp / 90;
+        frame.dts = frame.pts;
+        frame.width = width_;
+        frame.height = height_;
+        frame.fps = fps_;
+        frame.type = frame_is_idr_ ? FrameType::IDR : FrameType::P;
+        frame.managed_data = makeManagedBuffer(frame_buffer_.data(), frame_buffer_.size());
+        frame.data = frame.managed_data->empty() ? nullptr : frame.managed_data->data();
+        frame.size = frame.managed_data->size();
+
+        if (callback_) {
+            callback_(frame);
+        }
+        clearCurrentFrameState();
+    }
+
+    void receiveLoop() {
+        uint8_t buffer[65536];
+        std::string from_ip;
+        uint16_t from_port = 0;
+
+        while (running_) {
+            const ssize_t len = rtp_socket_.recvFrom(buffer, sizeof(buffer), from_ip, from_port);
+            if (len > 0) {
+                ingestRtpPacket(buffer, static_cast<size_t>(len));
+            } else {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        }
+    }
+
+    void processRtpPacket(const uint8_t* data, size_t len) {
+        if (len < 12) {
+            return;
+        }
+
+        const uint8_t version = (data[0] >> 6) & 0x03;
+        if (version != 2) {
+            return;
+        }
+
+        const bool marker = (data[1] >> 7) & 0x01;
+        const uint8_t payload_type = data[1] & 0x7F;
+        const uint16_t seq = static_cast<uint16_t>((data[2] << 8) | data[3]);
+        const uint32_t timestamp = (static_cast<uint32_t>(data[4]) << 24) |
+                                   (static_cast<uint32_t>(data[5]) << 16) |
+                                   (static_cast<uint32_t>(data[6]) << 8) |
+                                   static_cast<uint32_t>(data[7]);
+
+        if (seq_initialized_) {
+            const uint16_t expected = static_cast<uint16_t>(last_seq_ + 1);
+            if (seq != expected && codec_ == CodecType::H265 && h265_fu_in_progress_) {
+                h265_fu_drop_mode_ = true;
+                h265_fu_in_progress_ = false;
+                if (h265_fu_start_offset_ <= frame_buffer_.size()) {
+                    frame_buffer_.resize(h265_fu_start_offset_);
+                } else {
+                    frame_buffer_.clear();
+                }
+            }
+        }
+        seq_initialized_ = true;
+        last_seq_ = seq;
+
+        const uint8_t cc = data[0] & 0x0F;
+        const bool extension = (data[0] & 0x10) != 0;
+        const bool padding = (data[0] & 0x20) != 0;
+        size_t header_len = 12 + static_cast<size_t>(cc) * 4;
+        if (header_len > len) {
+            return;
+        }
+        if (extension) {
+            if (header_len + 4 > len) {
+                return;
+            }
+            const uint16_t ext_words = static_cast<uint16_t>((data[header_len + 2] << 8) | data[header_len + 3]);
+            const size_t ext_len = 4 + static_cast<size_t>(ext_words) * 4;
+            if (header_len + ext_len > len) {
+                return;
+            }
+            header_len += ext_len;
+        }
+        size_t payload_len = len - header_len;
+        if (padding) {
+            if (payload_len == 0) {
+                return;
+            }
+            const uint8_t pad_len = data[len - 1];
+            if (pad_len == 0 || pad_len > payload_len) {
+                return;
+            }
+            payload_len -= pad_len;
+        }
+
+        const uint8_t* payload = data + header_len;
+        if (payload_len == 0) {
+            return;
+        }
+
+        processVideoPayload(payload, payload_len, timestamp, marker, payload_type);
+    }
+
+    void processVideoPayload(const uint8_t* data, size_t len, uint32_t timestamp,
+                             bool marker, uint8_t payload_type) {
+        if (len == 0) {
+            return;
+        }
+
+        if (!frame_in_progress_) {
+            frame_ts_ = timestamp;
+            frame_in_progress_ = true;
+        } else if (timestamp != frame_ts_) {
+            if (codec_ == CodecType::H265 && h265_fu_drop_mode_) {
+                clearCurrentFrameState();
+                h265_fu_drop_mode_ = false;
+                h265_fu_in_progress_ = false;
+            } else {
+                emitFrame(frame_ts_);
+            }
+            frame_ts_ = timestamp;
+            frame_in_progress_ = true;
+        }
+
+        const bool is_h264 = (payload_type == payload_type_ && codec_ == CodecType::H264);
+        if (is_h264) {
+            const uint8_t nal_type = data[0] & 0x1F;
+            if (nal_type >= 1 && nal_type <= 23) {
+                appendAnnexBNalu(data, len);
+                if (nal_type == 5) {
+                    frame_is_idr_ = true;
+                }
+            } else if (nal_type == 24) {
+                size_t off = 1;
+                while (off + 2 <= len) {
+                    const uint16_t nalu_size = static_cast<uint16_t>((data[off] << 8) | data[off + 1]);
+                    off += 2;
+                    if (nalu_size == 0 || off + nalu_size > len) {
+                        break;
+                    }
+                    const uint8_t inner_type = data[off] & 0x1F;
+                    appendAnnexBNalu(data + off, nalu_size);
+                    if (inner_type == 5) {
+                        frame_is_idr_ = true;
+                    }
+                    off += nalu_size;
+                }
+            } else if (nal_type == 25) {
+                if (len < 3) {
+                    return;
+                }
+                size_t off = 3;
+                while (off + 2 <= len) {
+                    const uint16_t nalu_size = static_cast<uint16_t>((data[off] << 8) | data[off + 1]);
+                    off += 2;
+                    if (nalu_size == 0 || off + nalu_size > len) {
+                        break;
+                    }
+                    const uint8_t inner_type = data[off] & 0x1F;
+                    appendAnnexBNalu(data + off, nalu_size);
+                    if (inner_type == 5) {
+                        frame_is_idr_ = true;
+                    }
+                    off += nalu_size;
+                }
+            } else if (nal_type == 28 && len >= 2) {
+                const uint8_t fu_header = data[1];
+                const bool start = (fu_header & 0x80) != 0;
+                const uint8_t reconstructed_nal = (data[0] & 0xE0) | (fu_header & 0x1F);
+                if (start) {
+                    static const uint8_t start_code[] = {0x00, 0x00, 0x00, 0x01};
+                    frame_buffer_.insert(frame_buffer_.end(), start_code, start_code + 4);
+                    frame_buffer_.push_back(reconstructed_nal);
+                    if ((reconstructed_nal & 0x1F) == 5) {
+                        frame_is_idr_ = true;
+                    }
+                }
+                if (len > 2) {
+                    frame_buffer_.insert(frame_buffer_.end(), data + 2, data + len);
+                }
+            }
+        } else {
+            if (len < 2) {
+                return;
+            }
+            const uint8_t nal_type = (data[0] >> 1) & 0x3F;
+            if (nal_type != 49 && nal_type != 48 && nal_type != 50) {
+                appendAnnexBNalu(data, len);
+                if (isH265Irap(nal_type)) {
+                    frame_is_idr_ = true;
+                }
+            } else if (nal_type == 48) {
+                size_t off = 2;
+                while (off + 2 <= len) {
+                    const uint16_t nalu_size = static_cast<uint16_t>((data[off] << 8) | data[off + 1]);
+                    off += 2;
+                    if (nalu_size == 0 || off + nalu_size > len) {
+                        break;
+                    }
+                    const uint8_t inner_type = (data[off] >> 1) & 0x3F;
+                    appendAnnexBNalu(data + off, nalu_size);
+                    if (isH265Irap(inner_type)) {
+                        frame_is_idr_ = true;
+                    }
+                    off += nalu_size;
+                }
+            } else if (nal_type == 49 && len >= 3) {
+                const uint8_t fu_indicator0 = data[0];
+                const uint8_t fu_indicator1 = data[1];
+                const uint8_t fu_header = data[2];
+                const bool start = (fu_header & 0x80) != 0;
+                const bool end = (fu_header & 0x40) != 0;
+                const uint8_t orig_type = fu_header & 0x3F;
+                const uint8_t orig0 = (fu_indicator0 & 0x81) | (orig_type << 1);
+                const uint8_t orig1 = fu_indicator1;
+                if (start) {
+                    h265_fu_drop_mode_ = false;
+                    h265_fu_in_progress_ = true;
+                    h265_fu_start_offset_ = frame_buffer_.size();
+                    static const uint8_t start_code[] = {0x00, 0x00, 0x00, 0x01};
+                    frame_buffer_.insert(frame_buffer_.end(), start_code, start_code + 4);
+                    frame_buffer_.push_back(orig0);
+                    frame_buffer_.push_back(orig1);
+                    if (isH265Irap(orig_type)) {
+                        frame_is_idr_ = true;
+                    }
+                } else if (h265_fu_drop_mode_ || !h265_fu_in_progress_) {
+                    return;
+                }
+                if (len > 3 && !h265_fu_drop_mode_) {
+                    frame_buffer_.insert(frame_buffer_.end(), data + 3, data + len);
+                }
+                if (end && h265_fu_in_progress_) {
+                    h265_fu_in_progress_ = false;
+                }
+            }
+        }
+
+        if (marker) {
+            if (codec_ == CodecType::H265 && h265_fu_drop_mode_) {
+                clearCurrentFrameState();
+                h265_fu_drop_mode_ = false;
+                h265_fu_in_progress_ = false;
+                return;
+            }
+            emitFrame(timestamp);
+        }
+    }
+
+    Socket rtp_socket_;
+    Socket rtcp_socket_;
+    uint16_t rtp_port_ = 0;
+    uint16_t rtcp_port_ = 0;
+    std::atomic<bool> running_{false};
+    std::thread receive_thread_;
+    FrameCallback callback_;
+
+    CodecType codec_ = CodecType::H264;
+    uint8_t payload_type_ = 96;
+    uint32_t width_ = 1920;
+    uint32_t height_ = 1080;
+    uint32_t fps_ = 30;
+
+    std::vector<uint8_t> frame_buffer_;
+    uint32_t frame_ts_ = 0;
+    bool frame_in_progress_ = false;
+    bool frame_is_idr_ = false;
+    bool seq_initialized_ = false;
+    uint16_t last_seq_ = 0;
+    bool h265_fu_in_progress_ = false;
+    bool h265_fu_drop_mode_ = false;
+    size_t h265_fu_start_offset_ = 0;
+    uint32_t jitter_buffer_packets_ = 32;
+    std::map<uint16_t, std::vector<uint8_t>> reorder_buffer_;
+    bool reorder_initialized_ = false;
+    uint16_t expected_seq_ = 0;
+};
+
+bool parseAnnouncedPathConfig(const std::string& path,
+                              const std::string& sdp,
+                              PathConfig* config,
+                              uint8_t* payload_type) {
+    if (config == nullptr || payload_type == nullptr) {
+        return false;
+    }
+
+    SdpParser parser;
+    if (!parser.parse(sdp) || !parser.hasVideo()) {
+        return false;
+    }
+
+    const SdpMediaInfo video = parser.getVideoInfo();
+    const std::string payload_name_upper = toLowerCopy(video.payload_name);
+    const bool is_h264 = payload_name_upper.find("264") != std::string::npos;
+    const bool is_h265 = payload_name_upper.find("265") != std::string::npos ||
+                         payload_name_upper.find("hevc") != std::string::npos;
+    if ((!is_h264 && !is_h265) || video.payload_type == 0 || video.clock_rate == 0) {
+        return false;
+    }
+
+    config->path = path;
+    config->codec = is_h265 ? CodecType::H265 : CodecType::H264;
+    config->width = video.width != 0 ? video.width : 1920;
+    config->height = video.height != 0 ? video.height : 1080;
+    config->fps = video.fps != 0 ? video.fps : 30;
+    config->sps = video.sps.empty() ? std::vector<uint8_t>() : base64Decode(video.sps);
+    config->pps = video.pps.empty() ? std::vector<uint8_t>() : base64Decode(video.pps);
+    config->vps = video.vps.empty() ? std::vector<uint8_t>() : base64Decode(video.vps);
+    *payload_type = video.payload_type;
+    return true;
+}
+
 struct ServerRegistry {
     std::mutex mutex;
     std::unordered_map<uint16_t, std::weak_ptr<RtspServer>> instances;
@@ -247,16 +742,24 @@ struct ServerStatsAtomic {
     std::atomic<uint64_t> rtp_bytes_sent{0};
 };
 
+enum class SessionRole {
+    Player,
+    Publisher
+};
+
 // 客户端会话
 struct ClientSession {
     std::string session_id;
     std::string path;
     std::string client_ip;
+    SessionRole role = SessionRole::Player;
     uint16_t client_rtp_port = 0;
     uint16_t client_rtcp_port = 0;
-    
+
     std::unique_ptr<RtpSender> rtp_sender;
     std::unique_ptr<RtpPacker> rtp_packer;
+    std::unique_ptr<PublishRtpReceiver> rtp_receiver;
+    uint8_t publisher_payload_type = 96;
     bool use_tcp_interleaved = false;
     uint8_t interleaved_rtp_channel = 0;
     std::shared_ptr<Socket> control_socket;
@@ -291,6 +794,9 @@ struct ClientSession {
         if (send_thread.joinable()) {
             send_thread.join();
         }
+        if (rtp_receiver) {
+            rtp_receiver->stop();
+        }
         
         // 清理队列
         std::lock_guard<std::mutex> lock(queue_mutex);
@@ -302,6 +808,10 @@ struct ClientSession {
     }
     
     bool pushFrame(const VideoFrame& frame) {
+        if (role != SessionRole::Player) {
+            return false;
+        }
+
         std::lock_guard<std::mutex> lock(queue_mutex);
         if (frame_queue.size() >= MAX_QUEUE_SIZE) {
             // 队列满，丢弃最旧的帧
@@ -522,7 +1032,7 @@ public:
             if (path_it != paths_.end()) {
                 path_it->second->removeSession(session_->session_id);
             }
-            if (disconnect_cb_) {
+            if (disconnect_cb_ && session_->role == SessionRole::Player) {
                 disconnect_cb_(session_->path, session_->client_ip);
             }
         }
@@ -555,6 +1065,10 @@ private:
             case RtspMethod::Describe:
                 handleDescribe(request, cseq);
                 break;
+
+            case RtspMethod::Announce:
+                handleAnnounce(request, cseq);
+                break;
                 
             case RtspMethod::Setup:
                 handleSetup(request, cseq);
@@ -562,6 +1076,10 @@ private:
                 
             case RtspMethod::Play:
                 handlePlay(request, cseq);
+                break;
+
+            case RtspMethod::Record:
+                handleRecord(request, cseq);
                 break;
 
             case RtspMethod::Pause:
@@ -624,51 +1142,99 @@ private:
         
         sendResponse(RtspResponse::createDescribe(cseq, sdp.build()));
     }
-    
-    void handleSetup(const RtspRequest& request, int cseq) {
+
+    void handleAnnounce(const RtspRequest& request, int cseq) {
         if (session_) {
             sendResponse(RtspResponse::createError(cseq, 459, "Aggregate Operation Not Allowed"));
             return;
         }
 
         std::string path = extractPathFromUrl(request.getPath());
-        
-        // 从path中提取主路径
+
+        PathConfig announced_config{};
+        uint8_t payload_type = 96;
+        if (!parseAnnouncedPathConfig(path, request.getBody(), &announced_config, &payload_type)) {
+            sendResponse(RtspResponse::createError(cseq, 400, "Bad Request"));
+            return;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(paths_mutex_);
+            auto it = paths_.find(path);
+            if (it == paths_.end()) {
+                auto media_path = std::make_shared<MediaPath>();
+                media_path->path = path;
+                media_path->config = announced_config;
+                paths_[path] = media_path;
+            } else {
+                it->second->config.codec = announced_config.codec;
+                it->second->config.width = announced_config.width;
+                it->second->config.height = announced_config.height;
+                it->second->config.fps = announced_config.fps;
+                if (!announced_config.sps.empty()) {
+                    it->second->config.sps = announced_config.sps;
+                }
+                if (!announced_config.pps.empty()) {
+                    it->second->config.pps = announced_config.pps;
+                }
+                if (!announced_config.vps.empty()) {
+                    it->second->config.vps = announced_config.vps;
+                }
+            }
+        }
+
+        session_ = std::make_shared<ClientSession>();
+        session_->session_id = generateSessionId();
+        session_->path = path;
+        session_->client_ip = socket_->getPeerIp();
+        session_->role = SessionRole::Publisher;
+        session_->control_socket = socket_;
+        session_->control_send_mutex = send_mutex_;
+        session_->publisher_payload_type = payload_type;
+
+        RtspResponse response = RtspResponse::createOk(cseq);
+        response.setSession(session_->session_id);
+        sendResponse(response);
+    }
+
+    void handlePlayerSetup(const RtspRequest& request, int cseq) {
+        if (session_) {
+            sendResponse(RtspResponse::createError(cseq, 459, "Aggregate Operation Not Allowed"));
+            return;
+        }
+
+        std::string path = extractPathFromUrl(request.getPath());
         size_t slash_pos = path.find_last_of('/');
         if (slash_pos != std::string::npos) {
             path = path.substr(0, slash_pos);
         }
-        
+
         std::lock_guard<std::mutex> lock(paths_mutex_);
         auto it = paths_.find(path);
         if (it == paths_.end()) {
             sendResponse(RtspResponse::createError(cseq, 404, "Not Found"));
             return;
         }
-        
+
         auto& media_path = it->second;
-        
-        // 获取客户端端口
+
         std::string transport = request.getTransport();
-        
-        // 检查是否是 TCP 传输 (RTP/AVP/TCP)
-        bool use_tcp = (transport.find("RTP/AVP/TCP") != std::string::npos ||
-                        transport.find("TCP") != std::string::npos);
-        
-        int client_rtp_port = request.getRtpPort();
-        int client_rtcp_port = request.getRtcpPort();
-        
-        // UDP 模式需要客户端端口，TCP 模式不需要
+        const bool use_tcp = (transport.find("RTP/AVP/TCP") != std::string::npos ||
+                              transport.find("TCP") != std::string::npos);
+
+        const int client_rtp_port = request.getRtpPort();
+        const int client_rtcp_port = request.getRtcpPort();
+
         if (client_rtp_port == 0 && !use_tcp) {
             sendResponse(RtspResponse::createError(cseq, 400, "Bad Request"));
             return;
         }
-        
-        // 创建会话
+
         session_ = std::make_shared<ClientSession>();
         session_->session_id = generateSessionId();
         session_->path = path;
         session_->client_ip = socket_->getPeerIp();
+        session_->role = SessionRole::Player;
         session_->client_rtp_port = static_cast<uint16_t>(client_rtp_port);
         session_->client_rtcp_port = static_cast<uint16_t>(client_rtcp_port != 0 ? client_rtcp_port : client_rtp_port + 1);
         session_->use_tcp_interleaved = use_tcp;
@@ -736,6 +1302,99 @@ private:
         
         sendResponse(RtspResponse::createSetup(cseq, session_->session_id, transport_ss.str()));
     }
+
+    void handlePublisherSetup(const RtspRequest& request, int cseq) {
+        if (!session_ || session_->role != SessionRole::Publisher) {
+            sendResponse(RtspResponse::createError(cseq, 455, "Method Not Valid In This State"));
+            return;
+        }
+
+        const std::string transport = request.getTransport();
+        if (toLowerCopy(transport).find("tcp") != std::string::npos) {
+            sendResponse(RtspResponse::createError(cseq, 461, "Unsupported Transport"));
+            return;
+        }
+
+        const int client_rtp_port = request.getRtpPort();
+        const int client_rtcp_port = request.getRtcpPort();
+        if (client_rtp_port == 0) {
+            sendResponse(RtspResponse::createError(cseq, 400, "Bad Request"));
+            return;
+        }
+
+        std::shared_ptr<MediaPath> media_path;
+        {
+            std::lock_guard<std::mutex> lock(paths_mutex_);
+            auto it = paths_.find(session_->path);
+            if (it == paths_.end()) {
+                sendResponse(RtspResponse::createError(cseq, 404, "Not Found"));
+                return;
+            }
+            media_path = it->second;
+        }
+
+        session_->client_rtp_port = static_cast<uint16_t>(client_rtp_port);
+        session_->client_rtcp_port = static_cast<uint16_t>(client_rtcp_port != 0 ? client_rtcp_port : client_rtp_port + 1);
+
+        if (!session_->rtp_receiver) {
+            auto receiver = std::make_unique<PublishRtpReceiver>();
+            bool receiver_ready = false;
+            for (int attempt = 0; attempt < 32; ++attempt) {
+                const uint16_t local_rtp_port = RtspServerConfig::getNextRtpPort(
+                    config_.rtp_port_current, config_.rtp_port_start, config_.rtp_port_end);
+                if (receiver->init(local_rtp_port, static_cast<uint16_t>(local_rtp_port + 1))) {
+                    receiver_ready = true;
+                    break;
+                }
+            }
+            if (!receiver_ready) {
+                sendResponse(RtspResponse::createError(cseq, 500, "Internal Server Error"));
+                return;
+            }
+
+            receiver->setVideoInfo(media_path->config.codec,
+                                   media_path->config.width,
+                                   media_path->config.height,
+                                   media_path->config.fps,
+                                   session_->publisher_payload_type);
+            std::weak_ptr<MediaPath> weak_path = media_path;
+            receiver->setCallback([weak_path, this](const VideoFrame& frame) {
+                if (auto path = weak_path.lock()) {
+                    if (frame.codec == CodecType::H264 &&
+                        (frame.type == FrameType::IDR || path->config.sps.empty() || path->config.pps.empty())) {
+                        (void)autoExtractH264ParameterSets(path->config, frame.data, frame.size);
+                    } else if (frame.codec == CodecType::H265 &&
+                               (frame.type == FrameType::IDR || path->config.vps.empty() ||
+                                path->config.sps.empty() || path->config.pps.empty())) {
+                        (void)autoExtractH265ParameterSets(path->config, frame.data, frame.size);
+                    }
+                    path->broadcastFrame(frame);
+                    stats_.frames_pushed++;
+                }
+            });
+            session_->rtp_receiver = std::move(receiver);
+
+            media_path->addSession(session_->session_id, session_);
+            stats_.sessions_created++;
+        }
+
+        std::stringstream transport_ss;
+        transport_ss << "RTP/AVP;unicast;client_port=" << session_->client_rtp_port
+                     << "-" << session_->client_rtcp_port
+                     << ";server_port=" << session_->rtp_receiver->getRtpPort()
+                     << "-" << session_->rtp_receiver->getRtcpPort();
+
+        sendResponse(RtspResponse::createSetup(cseq, session_->session_id, transport_ss.str()));
+    }
+
+    void handleSetup(const RtspRequest& request, int cseq) {
+        if (isRecordTransport(request.getTransport()) ||
+            (session_ && session_->role == SessionRole::Publisher)) {
+            handlePublisherSetup(request, cseq);
+            return;
+        }
+        handlePlayerSetup(request, cseq);
+    }
     
     void handlePlay(const RtspRequest& request, int cseq) {
         if (!session_) {
@@ -760,6 +1419,26 @@ private:
         }
         
         sendResponse(RtspResponse::createPlay(cseq, session_->session_id));
+    }
+
+    void handleRecord(const RtspRequest& request, int cseq) {
+        if (!session_ || session_->role != SessionRole::Publisher || !session_->rtp_receiver) {
+            sendResponse(RtspResponse::createError(cseq, 455, "Method Not Valid In This State"));
+            return;
+        }
+
+        const std::string session_id = request.getSession();
+        if (!session_id.empty() && session_id != session_->session_id) {
+            sendResponse(RtspResponse::createError(cseq, 454, "Session Not Found"));
+            return;
+        }
+
+        session_->rtp_receiver->start();
+        session_->last_activity = std::chrono::steady_clock::now();
+
+        RtspResponse response = RtspResponse::createOk(cseq);
+        response.setSession(session_->session_id);
+        sendResponse(response);
     }
 
     void handlePause(const RtspRequest& request, int cseq) {
@@ -795,12 +1474,19 @@ private:
     void handleTeardown(const RtspRequest& request, int cseq) {
         (void)request;
         if (session_) {
-            auto path_it = paths_.find(session_->path);
-            if (path_it != paths_.end()) {
-                path_it->second->removeSession(session_->session_id);
+            std::shared_ptr<MediaPath> media_path;
+            {
+                std::lock_guard<std::mutex> lock(paths_mutex_);
+                auto path_it = paths_.find(session_->path);
+                if (path_it != paths_.end()) {
+                    media_path = path_it->second;
+                }
+            }
+            if (media_path) {
+                media_path->removeSession(session_->session_id);
             }
             stats_.sessions_closed++;
-            if (disconnect_cb_) {
+            if (disconnect_cb_ && session_->role == SessionRole::Player) {
                 disconnect_cb_(session_->path, session_->client_ip);
             }
             session_.reset();
@@ -942,6 +1628,7 @@ public:
     struct ConnectionHandle {
         std::shared_ptr<Socket> socket;
         std::thread thread;
+        std::shared_ptr<std::atomic<bool>> done;
     };
     std::vector<ConnectionHandle> connections_;
     
@@ -949,16 +1636,43 @@ public:
     std::mutex cleanup_mutex_;
     std::condition_variable cleanup_cv_;
     
+    void cleanupFinishedConnections() {
+        std::vector<ConnectionHandle> finished;
+        {
+            std::lock_guard<std::mutex> lock(connections_mutex_);
+            for (auto it = connections_.begin(); it != connections_.end();) {
+                if (it->done && it->done->load()) {
+                    finished.push_back({std::move(it->socket), std::move(it->thread), std::move(it->done)});
+                    it = connections_.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+
+        for (auto& handle : finished) {
+            if (handle.socket) {
+                handle.socket->close();
+                handle.socket.reset();
+            }
+            if (handle.thread.joinable()) {
+                handle.thread.join();
+            }
+        }
+    }
+
     void cleanupLoop() {
         while (true) {
             std::unique_lock<std::mutex> wait_lock(cleanup_mutex_);
-            cleanup_cv_.wait_for(wait_lock, std::chrono::seconds(5), [this]() {
+            cleanup_cv_.wait_for(wait_lock, std::chrono::milliseconds(100), [this]() {
                 return !running_.load();
             });
             if (!running_) {
                 break;
             }
             wait_lock.unlock();
+
+            cleanupFinishedConnections();
             
             // 清理超时会话
             std::vector<std::pair<std::string, std::string>> disconnects;
@@ -974,7 +1688,9 @@ public:
                             RTSP_LOG_INFO("Session timeout: " + it->first);
                             it->second->stop();
                             stats_.sessions_closed++;
-                            disconnects.emplace_back(path->path, it->second->client_ip);
+                            if (it->second->role == SessionRole::Player) {
+                                disconnects.emplace_back(path->path, it->second->client_ip);
+                            }
                             it = path->sessions.erase(it);
                         } else {
                             ++it;
@@ -988,6 +1704,8 @@ public:
                 }
             }
         }
+
+        cleanupFinishedConnections();
     }
 };
 
@@ -1023,15 +1741,20 @@ bool RtspServer::start() {
     
     impl_->tcp_server_->setNewConnectionCallback([this](std::unique_ptr<Socket> socket) {
         auto shared_socket = std::shared_ptr<Socket>(std::move(socket));
-        std::thread conn_thread([this, s = shared_socket]() mutable {
+        auto done = std::make_shared<std::atomic<bool>>(false);
+        std::thread conn_thread([this, s = shared_socket, done]() mutable {
             RtspConnection conn(s, impl_->paths_, impl_->paths_mutex_, impl_->config_,
                                 impl_->connect_callback_, impl_->disconnect_callback_,
                                 impl_->stats_);
             conn.handle();
+            if (s) {
+                s->close();
+            }
+            done->store(true);
         });
         {
             std::lock_guard<std::mutex> lock(impl_->connections_mutex_);
-            impl_->connections_.push_back({shared_socket, std::move(conn_thread)});
+            impl_->connections_.push_back({shared_socket, std::move(conn_thread), done});
         }
     });
     
@@ -1067,6 +1790,7 @@ bool RtspServer::stopWithTimeout(uint32_t timeout_ms) {
         impl_->tcp_server_->stop();
     }
     
+    std::vector<Impl::ConnectionHandle> connections;
     {
         std::lock_guard<std::mutex> lock(impl_->connections_mutex_);
         for (auto& c : impl_->connections_) {
@@ -1074,23 +1798,21 @@ bool RtspServer::stopWithTimeout(uint32_t timeout_ms) {
                 c.socket->close();
             }
         }
+        connections = std::move(impl_->connections_);
+        impl_->connections_.clear();
     }
     bool all_joined = true;
-    {
-        std::lock_guard<std::mutex> lock(impl_->connections_mutex_);
-        for (auto& c : impl_->connections_) {
-            uint32_t remain = 0;
-            auto now = std::chrono::steady_clock::now();
-            if (now < deadline) {
-                remain = static_cast<uint32_t>(
-                    std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count());
-            }
-            if (!joinThreadWithTimeout(c.thread, remain)) {
-                all_joined = false;
-                RTSP_LOG_ERROR("RtspServer stop timeout: connection thread still alive (blocking: RTSP connection loop)");
-            }
+    for (auto& c : connections) {
+        uint32_t remain = 0;
+        auto now = std::chrono::steady_clock::now();
+        if (now < deadline) {
+            remain = static_cast<uint32_t>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count());
         }
-        impl_->connections_.clear();
+        if (!joinThreadWithTimeout(c.thread, remain)) {
+            all_joined = false;
+            RTSP_LOG_ERROR("RtspServer stop timeout: connection thread still alive (blocking: RTSP connection loop)");
+        }
     }
 
     {

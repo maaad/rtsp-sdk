@@ -2,6 +2,7 @@
 #include <rtsp-common/common.h>
 #include <chrono>
 #include <iomanip>
+#include <regex>
 #include <sstream>
 
 namespace rtsp {
@@ -175,12 +176,107 @@ SdpParser::SdpParser(const std::string& sdp) {
 
 bool SdpParser::parse(const std::string& sdp) {
     sdp_ = sdp;
-    // 简单解析，实际使用时需要完整实现
-    return true;
+    media_infos_.clear();
+
+    std::istringstream stream(sdp);
+    std::string line;
+    SdpMediaInfo* current_media = nullptr;
+
+    while (std::getline(stream, line)) {
+        if (!line.empty() && line.back() == '\r') {
+            line.pop_back();
+        }
+
+        if (line.rfind("m=video", 0) == 0) {
+            media_infos_.emplace_back();
+            current_media = &media_infos_.back();
+
+            std::regex media_regex(R"(m=video\s+\d+\s+\S+\s+(\d+))", std::regex::icase);
+            std::smatch match;
+            if (std::regex_search(line, match, media_regex)) {
+                current_media->payload_type = static_cast<uint8_t>(std::stoi(match[1].str()));
+            }
+            continue;
+        }
+
+        if (current_media == nullptr) {
+            continue;
+        }
+
+        if (line.rfind("a=rtpmap:", 0) == 0) {
+            std::regex rtpmap_regex(R"(a=rtpmap:(\d+)\s+([A-Za-z0-9_-]+)/(\d+))", std::regex::icase);
+            std::smatch match;
+            if (std::regex_search(line, match, rtpmap_regex)) {
+                current_media->payload_type = static_cast<uint8_t>(std::stoi(match[1].str()));
+                current_media->payload_name = match[2].str();
+                current_media->clock_rate = static_cast<uint32_t>(std::stoul(match[3].str()));
+
+                std::string codec_name = current_media->payload_name;
+                for (char& ch : codec_name) {
+                    ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+                }
+                if (codec_name.find("264") != std::string::npos) {
+                    current_media->codec = CodecType::H264;
+                } else if (codec_name.find("265") != std::string::npos ||
+                           codec_name.find("HEVC") != std::string::npos) {
+                    current_media->codec = CodecType::H265;
+                }
+            }
+        } else if (line.rfind("a=framesize:", 0) == 0) {
+            std::regex size_regex(R"(a=framesize:\d+\s+(\d+)-(\d+))", std::regex::icase);
+            std::smatch match;
+            if (std::regex_search(line, match, size_regex)) {
+                current_media->width = static_cast<uint32_t>(std::stoul(match[1].str()));
+                current_media->height = static_cast<uint32_t>(std::stoul(match[2].str()));
+            }
+        } else if (line.rfind("a=cliprect:", 0) == 0) {
+            std::regex clip_regex(R"(a=cliprect:\d+,\d+,(\d+),(\d+))", std::regex::icase);
+            std::smatch match;
+            if (std::regex_search(line, match, clip_regex)) {
+                const uint32_t height = static_cast<uint32_t>(std::stoul(match[1].str()));
+                const uint32_t width = static_cast<uint32_t>(std::stoul(match[2].str()));
+                if (current_media->width == 0) {
+                    current_media->width = width;
+                }
+                if (current_media->height == 0) {
+                    current_media->height = height;
+                }
+            }
+        } else if (line.rfind("a=framerate:", 0) == 0) {
+            std::regex framerate_regex(R"(a=framerate:(\d+(?:\.\d+)?))", std::regex::icase);
+            std::smatch match;
+            if (std::regex_search(line, match, framerate_regex)) {
+                current_media->fps = static_cast<uint32_t>(std::stod(match[1].str()));
+            }
+        } else if (line.rfind("a=fmtp:", 0) == 0) {
+            std::regex h264_regex(R"(sprop-parameter-sets=([^,;\s]+),([^;\s]+))", std::regex::icase);
+            std::smatch h264_match;
+            if (std::regex_search(line, h264_match, h264_regex)) {
+                current_media->sps = h264_match[1].str();
+                current_media->pps = h264_match[2].str();
+            }
+
+            std::regex h265_vps_regex(R"(sprop-vps=([^;\s]+))", std::regex::icase);
+            std::regex h265_sps_regex(R"(sprop-sps=([^;\s]+))", std::regex::icase);
+            std::regex h265_pps_regex(R"(sprop-pps=([^;\s]+))", std::regex::icase);
+            std::smatch match;
+            if (std::regex_search(line, match, h265_vps_regex)) {
+                current_media->vps = match[1].str();
+            }
+            if (std::regex_search(line, match, h265_sps_regex)) {
+                current_media->sps = match[1].str();
+            }
+            if (std::regex_search(line, match, h265_pps_regex)) {
+                current_media->pps = match[1].str();
+            }
+        }
+    }
+
+    return !media_infos_.empty();
 }
 
 bool SdpParser::hasVideo() const {
-    return sdp_.find("m=video") != std::string::npos;
+    return !media_infos_.empty();
 }
 
 bool SdpParser::hasAudio() const {
@@ -189,21 +285,9 @@ bool SdpParser::hasAudio() const {
 
 SdpMediaInfo SdpParser::getVideoInfo() const {
     SdpMediaInfo info;
-    // 解析视频信息
-    if (sdp_.find("H264") != std::string::npos || 
-        sdp_.find("h264") != std::string::npos) {
-        info.codec = CodecType::H264;
-        info.payload_name = "H264";
-    } else if (sdp_.find("H265") != std::string::npos || 
-               sdp_.find("h265") != std::string::npos ||
-               sdp_.find("HEVC") != std::string::npos) {
-        info.codec = CodecType::H265;
-        info.payload_name = "H265";
+    if (!media_infos_.empty()) {
+        info = media_infos_.front();
     }
-    
-    // 解析sprop-parameter-sets或sprop-sps/sprop-pps
-    // 这里简化处理，实际应该使用正则表达式解析
-    
     return info;
 }
 

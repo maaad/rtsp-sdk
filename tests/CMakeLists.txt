@@ -22,6 +22,11 @@ add_executable(rtsp_test_integration test_integration.cpp)
 target_link_libraries(rtsp_test_integration PRIVATE rtsp-sdk)
 add_test(NAME test_integration COMMAND rtsp_test_integration)
 
+# publisher -> builtin server -> client bridge
+add_executable(rtsp_test_publish_server_bridge test_publish_server_bridge.cpp)
+target_link_libraries(rtsp_test_publish_server_bridge PRIVATE rtsp-sdk)
+add_test(NAME test_publish_server_bridge COMMAND rtsp_test_publish_server_bridge)
+
 # 客户端RTP聚合包回归测试
 add_executable(rtsp_test_client_rtp_aggregation test_client_rtp_aggregation.cpp)
 target_link_libraries(rtsp_test_client_rtp_aggregation PRIVATE rtsp-sdk)

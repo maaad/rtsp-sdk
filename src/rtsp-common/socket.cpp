@@ -135,6 +135,10 @@ bool Socket::bind(const std::string& ip, uint16_t port) {
     if (fd < 0) return false;
 
     impl_->fd_ = fd;
+    if (!setReuseAddr(true)) {
+        impl_->close();
+        return false;
+    }
     
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
@@ -231,6 +235,10 @@ bool Socket::bindUdp(const std::string& ip, uint16_t port) {
     if (fd < 0) return false;
 
     impl_->fd_ = fd;
+    if (!setReuseAddr(true)) {
+        impl_->close();
+        return false;
+    }
 
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
