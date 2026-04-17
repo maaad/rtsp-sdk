@@ -14,6 +14,7 @@
 #include <future>
 #include <algorithm>
 #include <cctype>
+#include <cstdint>
 
 namespace rtsp {
 
@@ -21,6 +22,299 @@ namespace {
 
 bool responseHasStatusCode(const std::string& response, int code) {
     return response.find(std::to_string(code)) != std::string::npos;
+}
+
+class BitReader {
+public:
+    explicit BitReader(const std::vector<uint8_t>& data) : data_(data) {}
+
+    bool readBit(uint32_t* bit) {
+        if (bit == nullptr || bit_offset_ >= data_.size() * 8U) {
+            return false;
+        }
+        const size_t byte_index = bit_offset_ / 8U;
+        const uint8_t bit_index = static_cast<uint8_t>(7U - (bit_offset_ % 8U));
+        *bit = static_cast<uint32_t>((data_[byte_index] >> bit_index) & 0x01U);
+        ++bit_offset_;
+        return true;
+    }
+
+    bool readBits(uint32_t count, uint32_t* value) {
+        if (value == nullptr || count > 32U) {
+            return false;
+        }
+        uint32_t result = 0U;
+        for (uint32_t i = 0; i < count; ++i) {
+            uint32_t bit = 0U;
+            if (!readBit(&bit)) {
+                return false;
+            }
+            result = (result << 1U) | bit;
+        }
+        *value = result;
+        return true;
+    }
+
+    bool readUE(uint32_t* value) {
+        if (value == nullptr) {
+            return false;
+        }
+        uint32_t zeros = 0U;
+        while (true) {
+            uint32_t bit = 0U;
+            if (!readBit(&bit)) {
+                return false;
+            }
+            if (bit != 0U) {
+                break;
+            }
+            ++zeros;
+            if (zeros > 31U) {
+                return false;
+            }
+        }
+        if (zeros == 0U) {
+            *value = 0U;
+            return true;
+        }
+        uint32_t suffix = 0U;
+        if (!readBits(zeros, &suffix)) {
+            return false;
+        }
+        *value = ((1U << zeros) - 1U) + suffix;
+        return true;
+    }
+
+    bool readSE(int32_t* value) {
+        if (value == nullptr) {
+            return false;
+        }
+        uint32_t code_num = 0U;
+        if (!readUE(&code_num)) {
+            return false;
+        }
+        const int32_t signed_value = (code_num & 0x01U)
+            ? static_cast<int32_t>((code_num + 1U) / 2U)
+            : -static_cast<int32_t>(code_num / 2U);
+        *value = signed_value;
+        return true;
+    }
+
+private:
+    const std::vector<uint8_t>& data_;
+    size_t bit_offset_{0};
+};
+
+std::vector<uint8_t> H264RbspFromSps(const std::vector<uint8_t>& sps) {
+    std::vector<uint8_t> out;
+    if (sps.size() <= 1) {
+        return out;
+    }
+
+    size_t offset = 0U;
+    if (sps.size() >= 4 && sps[0] == 0x00 && sps[1] == 0x00) {
+        if (sps[2] == 0x01) {
+            offset = 3U;
+        } else if (sps.size() >= 5 && sps[2] == 0x00 && sps[3] == 0x01) {
+            offset = 4U;
+        }
+    }
+    if (offset >= sps.size()) {
+        return out;
+    }
+
+    // Drop NAL header and convert EBSP to RBSP (remove emulation-prevention bytes 0x03).
+    if (offset + 1U >= sps.size()) {
+        return out;
+    }
+    ++offset;
+
+    out.reserve(sps.size() - offset);
+    for (size_t i = offset; i < sps.size(); ++i) {
+        if (i + 2U < sps.size() && sps[i] == 0x00 && sps[i + 1] == 0x00 && sps[i + 2] == 0x03) {
+            out.push_back(0x00);
+            out.push_back(0x00);
+            i += 2U;
+            continue;
+        }
+        out.push_back(sps[i]);
+    }
+    return out;
+}
+
+bool SkipScalingList(BitReader* br, int size_of_scaling_list) {
+    if (br == nullptr || size_of_scaling_list <= 0) {
+        return false;
+    }
+    int last_scale = 8;
+    int next_scale = 8;
+    for (int j = 0; j < size_of_scaling_list; ++j) {
+        if (next_scale != 0) {
+            int32_t delta_scale = 0;
+            if (!br->readSE(&delta_scale)) {
+                return false;
+            }
+            next_scale = (last_scale + delta_scale + 256) % 256;
+        }
+        last_scale = (next_scale == 0) ? last_scale : next_scale;
+    }
+    return true;
+}
+
+bool ParseH264DimensionsFromSps(const std::vector<uint8_t>& sps, uint32_t* width, uint32_t* height) {
+    if (width == nullptr || height == nullptr) {
+        return false;
+    }
+    *width = 0;
+    *height = 0;
+
+    const std::vector<uint8_t> rbsp = H264RbspFromSps(sps);
+    if (rbsp.empty()) {
+        return false;
+    }
+
+    BitReader br(rbsp);
+    uint32_t profile_idc = 0;
+    uint32_t tmp = 0;
+    if (!br.readBits(8U, &profile_idc) || !br.readBits(8U, &tmp) || !br.readBits(8U, &tmp)) {
+        return false;
+    }
+
+    uint32_t seq_parameter_set_id = 0;
+    if (!br.readUE(&seq_parameter_set_id)) {
+        return false;
+    }
+
+    uint32_t chroma_format_idc = 1U;
+    const bool high_profile =
+        profile_idc == 100U || profile_idc == 110U || profile_idc == 122U || profile_idc == 244U ||
+        profile_idc == 44U || profile_idc == 83U || profile_idc == 86U || profile_idc == 118U ||
+        profile_idc == 128U || profile_idc == 138U || profile_idc == 139U || profile_idc == 134U ||
+        profile_idc == 135U;
+    if (high_profile) {
+        if (!br.readUE(&chroma_format_idc)) {
+            return false;
+        }
+        if (chroma_format_idc == 3U) {
+            if (!br.readBits(1U, &tmp)) {
+                return false;
+            }
+        }
+        if (!br.readUE(&tmp) || !br.readUE(&tmp) || !br.readBits(1U, &tmp) || !br.readBits(1U, &tmp)) {
+            return false;
+        }
+        if (tmp != 0U) {
+            const int count = (chroma_format_idc != 3U) ? 8 : 12;
+            for (int i = 0; i < count; ++i) {
+                uint32_t seq_scaling_list_present_flag = 0U;
+                if (!br.readBits(1U, &seq_scaling_list_present_flag)) {
+                    return false;
+                }
+                if (seq_scaling_list_present_flag != 0U) {
+                    if (!SkipScalingList(&br, i < 6 ? 16 : 64)) {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+
+    if (!br.readUE(&tmp)) {  // log2_max_frame_num_minus4
+        return false;
+    }
+
+    uint32_t pic_order_cnt_type = 0;
+    if (!br.readUE(&pic_order_cnt_type)) {
+        return false;
+    }
+    if (pic_order_cnt_type == 0U) {
+        if (!br.readUE(&tmp)) {  // log2_max_pic_order_cnt_lsb_minus4
+            return false;
+        }
+    } else if (pic_order_cnt_type == 1U) {
+        if (!br.readBits(1U, &tmp)) {  // delta_pic_order_always_zero_flag
+            return false;
+        }
+        int32_t stmp = 0;
+        if (!br.readSE(&stmp) || !br.readSE(&stmp)) {
+            return false;
+        }
+        uint32_t num_ref_frames_in_pic_order_cnt_cycle = 0;
+        if (!br.readUE(&num_ref_frames_in_pic_order_cnt_cycle)) {
+            return false;
+        }
+        for (uint32_t i = 0; i < num_ref_frames_in_pic_order_cnt_cycle; ++i) {
+            if (!br.readSE(&stmp)) {
+                return false;
+            }
+        }
+    }
+
+    if (!br.readUE(&tmp) || !br.readBits(1U, &tmp)) {  // max_num_ref_frames, gaps_in_frame_num_value_allowed_flag
+        return false;
+    }
+
+    uint32_t pic_width_in_mbs_minus1 = 0;
+    uint32_t pic_height_in_map_units_minus1 = 0;
+    if (!br.readUE(&pic_width_in_mbs_minus1) || !br.readUE(&pic_height_in_map_units_minus1)) {
+        return false;
+    }
+
+    uint32_t frame_mbs_only_flag = 0;
+    if (!br.readBits(1U, &frame_mbs_only_flag)) {
+        return false;
+    }
+    if (frame_mbs_only_flag == 0U) {
+        if (!br.readBits(1U, &tmp)) {  // mb_adaptive_frame_field_flag
+            return false;
+        }
+    }
+    if (!br.readBits(1U, &tmp)) {  // direct_8x8_inference_flag
+        return false;
+    }
+
+    uint32_t frame_cropping_flag = 0;
+    if (!br.readBits(1U, &frame_cropping_flag)) {
+        return false;
+    }
+
+    uint32_t frame_crop_left_offset = 0;
+    uint32_t frame_crop_right_offset = 0;
+    uint32_t frame_crop_top_offset = 0;
+    uint32_t frame_crop_bottom_offset = 0;
+    if (frame_cropping_flag != 0U) {
+        if (!br.readUE(&frame_crop_left_offset) ||
+            !br.readUE(&frame_crop_right_offset) ||
+            !br.readUE(&frame_crop_top_offset) ||
+            !br.readUE(&frame_crop_bottom_offset)) {
+            return false;
+        }
+    }
+
+    uint32_t crop_unit_x = 1U;
+    uint32_t crop_unit_y = (frame_mbs_only_flag == 0U) ? 2U : 1U;
+    if (chroma_format_idc == 1U) {
+        crop_unit_x = 2U;
+        crop_unit_y = 2U * ((frame_mbs_only_flag == 0U) ? 2U : 1U);
+    } else if (chroma_format_idc == 2U) {
+        crop_unit_x = 2U;
+        crop_unit_y = (frame_mbs_only_flag == 0U) ? 2U : 1U;
+    } else if (chroma_format_idc == 3U) {
+        crop_unit_x = 1U;
+        crop_unit_y = (frame_mbs_only_flag == 0U) ? 2U : 1U;
+    }
+
+    uint32_t parsed_width = (pic_width_in_mbs_minus1 + 1U) * 16U;
+    uint32_t parsed_height = (2U - frame_mbs_only_flag) * (pic_height_in_map_units_minus1 + 1U) * 16U;
+    const uint32_t crop_x = (frame_crop_left_offset + frame_crop_right_offset) * crop_unit_x;
+    const uint32_t crop_y = (frame_crop_top_offset + frame_crop_bottom_offset) * crop_unit_y;
+    if (parsed_width <= crop_x || parsed_height <= crop_y) {
+        return false;
+    }
+
+    *width = parsed_width - crop_x;
+    *height = parsed_height - crop_y;
+    return *width > 0U && *height > 0U;
 }
 
 std::shared_ptr<std::vector<uint8_t>> makeManagedBuffer(const uint8_t* data, size_t size) {
@@ -714,6 +1008,10 @@ public:
                 session_info_.has_video = true;
                 session_info_.media_streams.emplace_back();
                 current_media = &session_info_.media_streams.back();
+                // Mark dimensions/fps as unknown until parsed from SDP attributes or SPS.
+                current_media->width = 0;
+                current_media->height = 0;
+                current_media->fps = 0;
                 
                 std::istringstream iss(line);
                 std::string type, port, proto, pt;
@@ -796,6 +1094,16 @@ public:
         }
 
         for (auto& media : session_info_.media_streams) {
+            if ((media.width == 0 || media.height == 0) &&
+                media.codec == CodecType::H264 &&
+                !media.sps.empty()) {
+                uint32_t parsed_width = 0;
+                uint32_t parsed_height = 0;
+                if (ParseH264DimensionsFromSps(media.sps, &parsed_width, &parsed_height)) {
+                    media.width = parsed_width;
+                    media.height = parsed_height;
+                }
+            }
             if (media.width == 0) media.width = 1920;
             if (media.height == 0) media.height = 1080;
             if (media.fps == 0) media.fps = 30;
